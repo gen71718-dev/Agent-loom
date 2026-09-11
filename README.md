@@ -13,6 +13,29 @@
 **想搞懂每个组件为什么这样配合**，看 [docs/architecture.md](docs/architecture.md)（含时序图、耦合方式、踩坑记录）。
 **只想跑起来**，往下看。
 
+## 能做什么
+
+**已实现**
+
+- **多轮对话与工具调用**：一张 ReAct 图，模型自主决定何时调用工具。内置 `current_time`（任意 IANA 时区）与 `calculator`（四则运算）。
+- **会话记忆**：按 `thread_id` 隔离，状态落在 Redis。服务重启、多副本部署都不丢；可配 TTL 自动过期。
+- **历史回读与删除**：`GET /threads/{id}` 读回完整会话（可用来验证记忆确实落库），`DELETE /threads/{id}` 满足"用户行使删除权"。
+- **流式输出**：SSE 逐 token 下发，另带节点级事件，前端可以提示"正在调工具"。
+- **全链路追踪**：每次运行的每一步自动上报 LangSmith，可按 `thread_id` / `user_id` 筛选。
+- **探活与降级可见**：`/healthz` 真实探测 Redis，连不上如实返回 `degraded`，不假装健康。
+- **零依赖测试**：21 个用例；单测不需要 Redis、网络、API Key，Redis 集成测试在无 Redis 时自动跳过。
+
+**有意不做（留给下一步）**
+
+- 人工审批中断恢复（`interrupt`）、多 agent 协作（supervisor + worker 子图）
+- 跨会话长期记忆（`AsyncRedisStore`：记住"用户是谁"，而不只是"这次聊到哪"）
+- 鉴权与多租户：当前 `thread_id` 由客户端传入，**生产环境必须由服务端签发或严格校验**
+- 评测集与回归（LangSmith dataset + evaluator）
+
+内置工具只有两个是刻意的，为了让示例保持可读。加一个工具只需三步：
+在 `src/agent_loom/tools.py` 写一个带 docstring 的 `@tool` 函数（docstring 就是模型看到的工具说明），
+加进 `TOOLS` 列表，完事——图的代码一行都不用动。
+
 ## 架构
 
 ```
