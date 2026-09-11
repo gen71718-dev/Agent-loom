@@ -12,9 +12,12 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, description="用户这一轮说的话")
     thread_id: str | None = Field(
         default=None,
-        description="会话 ID。不传则服务端新建一个并在响应里返回，客户端应保存下来继续使用。",
+        pattern=r"^[A-Za-z0-9_-]{1,64}$",
+        description=(
+            "会话 ID。不传则服务端新建一个并在响应里返回，客户端应保存下来继续使用。"
+            "只允许字母、数字、下划线与短横线。"
+        ),
     )
-    user_id: str | None = Field(default=None, description="终端用户标识，仅写入 LangSmith 元数据")
 
 
 class ChatResponse(BaseModel):

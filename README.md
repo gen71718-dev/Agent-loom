@@ -23,13 +23,14 @@
 - **流式输出**：SSE 逐 token 下发，另带节点级事件，前端可以提示"正在调工具"。
 - **全链路追踪**：每次运行的每一步自动上报 LangSmith，可按 `thread_id` / `user_id` 筛选。
 - **探活与降级可见**：`/healthz` 真实探测 Redis，连不上如实返回 `degraded`，不假装健康。
-- **零依赖测试**：21 个用例；单测不需要 Redis、网络、API Key，Redis 集成测试在无 Redis 时自动跳过。
+- **接口鉴权与多租户隔离**：`Authorization: Bearer <API Key>`，身份只来自凭据；内部存储键带 `user_id` 前缀，两个用户即便使用同一个 `thread_id` 也互不可见、互不可删。
+- **零依赖测试**：29 个用例；单测不需要 Redis、网络、API Key，Redis 集成测试在无 Redis 时自动跳过。
 
 **有意不做（留给下一步）**
 
 - 人工审批中断恢复（`interrupt`）、多 agent 协作（supervisor + worker 子图）
 - 跨会话长期记忆（`AsyncRedisStore`：记住"用户是谁"，而不只是"这次聊到哪"）
-- 鉴权与多租户：当前 `thread_id` 由客户端传入，**生产环境必须由服务端签发或严格校验**
+- 用户体系与限流：鉴权是静态 API Key（从 `.env` 读），没有注册登录、没有配额与速率限制
 - 评测集与回归（LangSmith dataset + evaluator）
 
 内置工具只有两个是刻意的，为了让示例保持可读。加一个工具只需三步：
@@ -72,6 +73,7 @@ uv sync
 
 # 3. 配置（Windows 上用 copy .env.example .env）
 cp .env.example .env      # 填入 LLM_API_KEY；要开追踪再填 LANGSMITH_API_KEY
+# 默认给了本地开发用的 API Key（local-dev-key-0001），生产务必换成强随机值
 
 # 4. 启动
 uv run uvicorn agent_loom.main:app --reload --port 8000
@@ -80,10 +82,13 @@ uv run uvicorn agent_loom.main:app --reload --port 8000
 看到这行日志才算真的起来了：
 
 ```
-INFO:agent_loom:AgentLoom ready | model=deepseek-chat | redis=redis://localhost:6379/0 | tracing=True
+INFO:agent_loom:AgentLoom ready | model=deepseek-chat | redis=redis://localhost:6379/0 | tracing=True | api_keys=1
 ```
 
-打开 http://127.0.0.1:8000/docs 可以直接在浏览器里试接口。
+`api_keys` 是已加载的凭据数量。为 0 时所有 `/chat` 与 `/threads` 请求都会被拒绝——这是刻意的
+fail-closed，而不是默认放行。
+
+打开 http://127.0.0.1:8000/docs 可以在浏览器里试接口（点右上角 Authorize 填 API Key）。
 
 ### 用第三方模型
 
@@ -100,22 +105,25 @@ LLM_BASE_URL=https://api.deepseek.com/v1
 # 第一轮
 curl -s -X POST http://127.0.0.1:8000/chat \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer local-dev-key-0001" \
   -d '{"message":"帮我算一下 (128+72)*3/4"}'
 # {"thread_id":"7f3c...","answer":"(128+72)*3/4 = 150","tool_calls":["calculator"]}
 
 # 第二轮：带上同一个 thread_id，模型记得上一轮说过什么
 curl -s -X POST http://127.0.0.1:8000/chat \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer local-dev-key-0001" \
   -d '{"message":"把刚才那个结果再乘以 2","thread_id":"7f3c..."}'
 # {"thread_id":"7f3c...","answer":"150 × 2 = 300","tool_calls":["calculator"]}
 
 # 流式：逐字返回
 curl -N -X POST http://127.0.0.1:8000/chat/stream \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer local-dev-key-0001" \
   -d '{"message":"现在几点了？","thread_id":"7f3c..."}'
 
 # 验证记忆真的落库了（不是存在进程内存里）
-curl -s http://127.0.0.1:8000/threads/7f3c...
+curl -s -H "Authorization: Bearer local-dev-key-0001" http://127.0.0.1:8000/threads/7f3c...
 
 # 重启服务，再问一次"我叫什么" —— 上下文依然在，这就是 checkpointer 的价值
 ```
@@ -125,7 +133,10 @@ curl -s http://127.0.0.1:8000/threads/7f3c...
 ```javascript
 const res = await fetch("http://127.0.0.1:8000/chat/stream", {
   method: "POST",
-  headers: { "Content-Type": "application/json" },
+  headers: {
+    "Content-Type": "application/json",
+    Authorization: "Bearer local-dev-key-0001",
+  },
   body: JSON.stringify({ message: "现在几点了？", thread_id: threadId }),
 });
 const reader = res.body.getReader();
@@ -147,8 +158,32 @@ for (;;) {
 | `GET` | `/threads/{thread_id}` | 读回会话的完整状态（可用来验证记忆确实落库） |
 | `DELETE` | `/threads/{thread_id}` | 删除会话，隐私合规的"用户行使删除权"落点 |
 
-`thread_id` 是会话主键：不传则服务端新建并在响应里返回，客户端要保存下来继续用。
-**生产环境务必由服务端生成或严格校验**，否则用户传别人的 ID 就能读到别人的对话。
+除 `/healthz` 外，所有接口都要求 `Authorization: Bearer <API Key>`，缺失或错误返回 `401`。
+
+### 鉴权与多租户
+
+配置在 `.env`，格式为 `key:user_id`，逗号分隔。Key 至少 16 位，**启动时校验**，不合格直接拒绝启动：
+
+```ini
+API_KEYS=local-dev-key-0001:dev,another-dev-key-0002:alice
+```
+
+生产环境请生成强随机 Key：
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+两条设计原则：
+
+- **身份只来自凭据**：请求体里没有任何"我是谁"的字段。让客户端自报身份，等于把鉴权交给攻击者。
+- **隔离靠派生存储键，不是先查后判**：内部 `thread_id` 是 `{user_id}:{客户端 id}`，别人的键你根本
+  构造不出来。所以两个用户即使用同一个 `thread_id`，也看不到、删不掉对方的数据。
+  这比"每次请求先查 owner 注册表再判断"更稳：查询有竞态、记录有 TTL 不一致、新增接口容易漏检查。
+
+`thread_id` 是客户端可见的会话主键：不传则服务端生成并返回，客户端保存后继续用。
+只允许字母、数字、下划线与短横线（1-64 位）。读别人的会话会返回**空列表而不是 404**——
+让"不存在"与"无权访问"表现一致，调用方就拿不到"这个 id 是否存在"的信息。
 
 ## Docker
 
@@ -196,6 +231,7 @@ src/agent_loom/
   两种事件天然不同频率，需要分开处理。
 - **`CHECKPOINTER=memory` 和 `redis` 的区别**：checkpointer 是接口，两种实现可互换。
   `memory` 免 Docker、但进程一停就没了，且无法在多副本间共享，只适合本地开发。
+- **为什么请求体里没有 `user_id`**：身份只能来自凭据。客户端自报身份是最容易被写出来的鉴权漏洞。
 
 ## 常见故障排查
 
@@ -207,6 +243,8 @@ src/agent_loom/
 | 启动报 RediSearch / `FT.CREATE` 相关错误 | Redis 不是 Stack 版本，缺 RediSearch 模块 | 换 `redis/redis-stack-server` 镜像 |
 | 工具返回"未知时区" | Windows 上没有系统时区库 | 已通过 `tzdata` 依赖解决，勿删该依赖 |
 | `/healthz` 返回 `degraded` | Redis 连不上 | 检查 `REDIS_URL` 与容器状态 |
+| `/chat` 返回 `401` | 没带 `Authorization` 头，或 Key 不在 `API_KEYS` 里 | 检查请求头与 `.env`；启动日志里的 `api_keys=N` 能确认配置是否生效 |
+| 启动报 `API_KEYS 里的 Key 太短` | Key 少于 16 位 | 用 `python -c "import secrets; print(secrets.token_urlsafe(32))"` 生成 |
 | 模型报 400 / model not found | `LLM_MODEL` 与 `LLM_BASE_URL` 不匹配 | 第三方端点要用它自己的模型名，如 `deepseek-chat` |
 
 ## 测试
@@ -226,7 +264,7 @@ uv run ruff check .
 3. 加长期记忆：用 `AsyncRedisStore` 存跨会话的用户偏好，与按会话隔离的 checkpointer 分工。
 4. 加评测：在 LangSmith 里建数据集 + evaluator，每次改提示词都跑一遍回归。
 
-详见 [docs/architecture.md](docs/architecture.md#八演进到多-agent)。
+详见 [docs/architecture.md](docs/architecture.md#九演进到多-agent)。
 
 ## License
 

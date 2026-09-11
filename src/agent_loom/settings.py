@@ -45,6 +45,9 @@ class Settings(BaseSettings):
 
     cors_origins: str = "*"
 
+    # 鉴权：格式 `key:user_id,key:user_id`。留空则拒绝所有请求（fail closed）
+    api_keys: str = ""
+
     @field_validator("llm_base_url", mode="after")
     @classmethod
     def _blank_to_none(cls, value: str | None) -> str | None:
@@ -54,9 +57,41 @@ class Settings(BaseSettings):
         """
         return value or None
 
+    @field_validator("api_keys", mode="after")
+    @classmethod
+    def _validate_api_keys(cls, value: str) -> str:
+        """启动时就校验格式，别等第一个请求进来才发现配错。
+
+        过短的 Key 是最常见的凭证事故来源，这里直接拒绝。
+        """
+        seen: set[str] = set()
+        for item in _iter_api_key_entries(value):
+            key, _, user_id = item.partition(":")
+            if not user_id:
+                raise ValueError(f"API_KEYS 条目缺少 user_id，应为 `key:user_id`：{item!r}")
+            if len(key) < 16:
+                raise ValueError(f"API_KEYS 里的 Key 太短（至少 16 位）：{key[:4]}***")
+            if key in seen:
+                raise ValueError("API_KEYS 里存在重复的 Key")
+            seen.add(key)
+        return value
+
+    @property
+    def api_key_map(self) -> dict[str, str]:
+        """API Key → 用户标识。"""
+        result: dict[str, str] = {}
+        for item in _iter_api_key_entries(self.api_keys):
+            key, _, user_id = item.partition(":")
+            result[key] = user_id
+        return result
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
+
+
+def _iter_api_key_entries(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 @lru_cache

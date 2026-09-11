@@ -1,4 +1,4 @@
-"""测试公共设施：一个按脚本回答的假模型。
+"""测试公共设施：假模型、环境隔离与应用夹具。
 
 为什么要假模型：单测不该依赖外部 API（慢、要钱、结果不稳定），
 但图的路由、状态合并、记忆持久化这些逻辑依然值得被真实验证。
@@ -13,6 +13,13 @@ import pytest
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+
+from agent_loom.graph import build_agent as real_build_agent
+from agent_loom.settings import Settings
+
+ALICE_KEY = "test-key-alice-00000001"
+BOB_KEY = "test-key-bob-0000000002"
+API_KEYS = f"{ALICE_KEY}:alice,{BOB_KEY}:bob"
 
 
 class ScriptedChatModel(BaseChatModel):
@@ -72,3 +79,45 @@ def make_scripted_model():
         return ScriptedChatModel(responses=responses)
 
     return _factory
+
+
+@pytest.fixture
+def app_env(monkeypatch) -> Settings:
+    """给应用注入一份完全隔离的测试配置。
+
+    关键点：不能让应用去读开发机的 .env。否则测试结果依赖本机环境，
+    而且真的会按 .env 里的 LangSmith Key 往云端上传 trace。
+    """
+    isolated = Settings(
+        _env_file=None,
+        checkpointer="memory",
+        llm_api_key="sk-test",
+        langsmith_tracing=False,
+        langsmith_api_key="",
+        api_keys=API_KEYS,
+    )
+    monkeypatch.setattr("agent_loom.main.get_settings", lambda: isolated)
+    return isolated
+
+
+@pytest.fixture
+def use_model(monkeypatch):
+    """替换 main.build_agent，让 lifespan 建图时用上假模型。"""
+
+    def _apply(model) -> None:
+        def build(settings, checkpointer=None):
+            return real_build_agent(settings, checkpointer=checkpointer, llm=model)
+
+        monkeypatch.setattr("agent_loom.main.build_agent", build)
+
+    return _apply
+
+
+@pytest.fixture
+def alice() -> dict[str, str]:
+    return {"Authorization": f"Bearer {ALICE_KEY}"}
+
+
+@pytest.fixture
+def bob() -> dict[str, str]:
+    return {"Authorization": f"Bearer {BOB_KEY}"}

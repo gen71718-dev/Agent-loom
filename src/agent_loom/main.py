@@ -39,11 +39,17 @@ async def lifespan(app: FastAPI):
         # 图只编译一次并复用：它内部持有连接池与编译结果，每请求新建会拖垮性能
         app.state.graph = build_agent(settings, checkpointer=checkpointer)
         logger.info(
-            "AgentLoom ready | model=%s | redis=%s | tracing=%s",
+            "AgentLoom ready | model=%s | redis=%s | tracing=%s | api_keys=%d",
             settings.llm_model,
             settings.redis_url,
             tracing,
+            len(settings.api_key_map),
         )
+        if not settings.api_key_map:
+            logger.warning(
+                "未配置 API_KEYS：所有 /chat 与 /threads 请求都会返回 401。"
+                "本地开发请在 .env 里设置 API_KEYS=<key>:<user_id>（Key 至少 16 位）"
+            )
         yield
 
     await app.state.redis.aclose()
@@ -53,7 +59,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(
         title=settings.app_name,
-        version="0.1.0",
+        version="0.2.0",
         description="LangGraph + Redis + LangSmith + FastAPI 的单智能体服务",
         lifespan=lifespan,
     )

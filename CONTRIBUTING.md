@@ -22,6 +22,14 @@ uv run pytest -q             # 集成测试会自动检测 Redis，不可用则�
 - 配置只走 `settings.py`，不要在业务代码里直接读 `os.environ`。
 - 提交前跑 `ruff check .` 与 `pytest`。
 
+## 安全相关改动
+
+- 身份字段**永远不能**出现在请求体或查询参数里，只能来自 `Authorization` 头。
+- 任何按 `thread_id` 操作的新接口都必须走 `security.resolve_thread()` 派生内部键，
+  不允许自己拼键，更不允许直接把客户端传入的 id 当存储键用。
+- 涉及鉴权或租户隔离的改动，必须同时补"跨租户越权"的反向测试，
+  参考 `tests/test_auth.py::test_same_thread_id_is_isolated_between_users`。
+
 ## 提交与 PR
 
 - 提交信息用祈使句，说明"做了什么"，例如 `新增 human-in-the-loop 中断恢复`。
