@@ -3,9 +3,9 @@
 > 基于 **LangGraph + Redis + LangSmith + FastAPI** 的单智能体服务。
 > 一张手工搭建的 ReAct 图、一份存在 Redis 里的真实记忆、一条可回放的执行链路。
 
+[![CI](https://github.com/gen71718-dev/Agent-loom/actions/workflows/ci.yml/badge.svg)](https://github.com/gen71718-dev/Agent-loom/actions/workflows/ci.yml)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
-![tests](https://img.shields.io/badge/tests-21%20passed-brightgreen)
 
 单 agent 是底座，不是终点：把 `tools` 换成子图、把 `agent` 拆成 supervisor + worker，
 这张图就长成了多 agent 团队，而记忆层、可观测层、服务层一行都不用改。

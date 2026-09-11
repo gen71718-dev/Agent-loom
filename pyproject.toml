@@ -20,6 +20,11 @@ dependencies = [
     "httpx>=0.28.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/gen71718-dev/Agent-loom"
+Repository = "https://github.com/gen71718-dev/Agent-loom"
+Issues = "https://github.com/gen71718-dev/Agent-loom/issues"
+
 [dependency-groups]
 dev = [
     "pytest>=8.3.0",
