@@ -1,0 +1,35 @@
+services:
+  redis:
+    # 必须是 redis-stack：LangGraph 的检查点依赖 RediSearch 建索引，原生 redis 镜像没有该模块
+    image: redis/redis-stack-server:latest
+    container_name: agent-loom-redis
+    ports:
+      - "6379:6379"
+    environment:
+      REDIS_ARGS: "--save 60 1 --appendonly yes"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    # 放在 full 这个 profile 里：默认 `docker compose up -d` 只起 Redis，
+    # 想在容器里跑服务时用 `docker compose --profile full up -d`
+    profiles: ["full"]
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # 容器内要用服务名访问 Redis，localhost 指向容器自己
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+
+volumes:
+  redis-data:

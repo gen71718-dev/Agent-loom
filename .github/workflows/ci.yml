@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: 按锁文件安装依赖
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check .
+
+      # 测试默认走内存检查点与假模型，不需要 Redis、不需要 API Key
+      - name: 测试
+        run: uv run pytest -q
