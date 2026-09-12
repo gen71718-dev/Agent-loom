@@ -1,4 +1,4 @@
-name: CI
+name: CI    #持续集成配置文件defaults:
 
 on:
   push:
