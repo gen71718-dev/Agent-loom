@@ -2,7 +2,7 @@
 
 import pytest
 
-from agent_loom.tools import TOOLS, calculator, current_time
+from agent_loom.tools import TOOLS, calculator, current_time, notify
 
 
 @pytest.mark.parametrize(
@@ -27,5 +27,14 @@ def test_current_time_handles_unknown_timezone() -> None:
     assert current_time.invoke({"timezone": "Mars/Olympus"}).startswith("未知时区")
 
 
+def test_notify_returns_receipt() -> None:
+    """notify 本体只负责"提交并回执"；真正的准入闸门在图的审批节点，不在这里。
+
+    这种分工让工具保持纯粹、可单测，而"谁能执行"的策略集中在图里，改策略不用动工具。
+    """
+    result = notify.invoke({"channel": "email", "message": "部署完成"})
+    assert result.startswith("已提交到 email 渠道，回执号 ")
+
+
 def test_tools_are_registered() -> None:
-    assert [tool.name for tool in TOOLS] == ["calculator", "current_time"]
+    assert [tool.name for tool in TOOLS] == ["calculator", "current_time", "notify"]

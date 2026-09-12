@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 
@@ -50,13 +51,26 @@ class ScriptedChatModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=self._next())])
 
     async def _astream(self, messages, stop=None, run_manager=None, **kwargs):
-        # 图开启 messages 流式时会走这里：把整条脚本消息作为单个分片吐出
+        # 图开启 messages 流式时会走这里：把整条脚本消息作为单个分片吐出。
+        #
+        # 分片必须用 tool_call_chunks（带 index 的"增量协议"）而不是 tool_calls：
+        # tool_calls 是"已解析完成"的形态，塞进分片会因缺少 index 字段校验失败，
+        # 表现为流式接口里冒出一条 `event: error`。args 在增量协议里是 JSON 字符串。
         message = self._next()
-        tool_calls = [
-            {**call, "index": index} for index, call in enumerate(message.tool_calls or [])
+        tool_call_chunks = [
+            {
+                "name": call["name"],
+                "args": json.dumps(call["args"], ensure_ascii=False),
+                "id": call["id"],
+                "index": index,
+                "type": "tool_call_chunk",
+            }
+            for index, call in enumerate(message.tool_calls or [])
         ]
         yield ChatGenerationChunk(
-            message=AIMessageChunk(content=message.content, tool_calls=tool_calls, id=message.id)
+            message=AIMessageChunk(
+                content=message.content, tool_call_chunks=tool_call_chunks, id=message.id
+            )
         )
 
 

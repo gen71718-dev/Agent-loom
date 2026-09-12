@@ -30,8 +30,17 @@ uv run pytest -q             # 集成测试会自动检测 Redis，不可用则�
 - 涉及鉴权或租户隔离的改动，必须同时补"跨租户越权"的反向测试，
   参考 `tests/test_auth.py::test_same_thread_id_is_isolated_between_users`。
 
+## 工具与人工审批
+
+- 有副作用的工具（写外部系统、发消息、动数据）必须登记进 `APPROVAL_REQUIRED_TOOLS`，
+  并补一条"挂起期间不执行、批准后才执行"的测试，参考 `tests/test_approval.py`。
+- `interrupt()` 之前不能有任何副作用（写库、发请求、打点）：节点恢复时会从函数第一行重放，
+  这段代码会被执行两次。
+- 拒绝一批调用时，必须给本批**全部** `tool_call` 补上 `ToolMessage`——OpenAI 兼容协议要求
+  二者严格一一对应，少一条下一轮模型调用就会报错。
+
 ## 提交与 PR
 
-- 提交信息用祈使句，说明"做了什么"，例如 `新增 human-in-the-loop 中断恢复`。
+- 提交信息用祈使句，说明"做了什么"，例如 `新增 supervisor + worker 子图`。
 - PR 描述里写清：动机、行为变化、如何验证。
 - 涉及行为变更的，同步更新 `README.md` 或 `docs/architecture.md`。

@@ -17,25 +17,29 @@
 
 **已实现**
 
-- **多轮对话与工具调用**：一张 ReAct 图，模型自主决定何时调用工具。内置 `current_time`（任意 IANA 时区）与 `calculator`（四则运算）。
+- **多轮对话与工具调用**：一张 ReAct 图，模型自主决定何时调用工具。内置 `current_time`（任意 IANA 时区）、`calculator`（四则运算）与 `notify`（发通知，执行前需人工审批）。
 - **会话记忆**：按 `thread_id` 隔离，状态落在 Redis。服务重启、多副本部署都不丢；可配 TTL 自动过期。
 - **历史回读与删除**：`GET /threads/{id}` 读回完整会话（可用来验证记忆确实落库），`DELETE /threads/{id}` 满足"用户行使删除权"。
 - **流式输出**：SSE 逐 token 下发，另带节点级事件，前端可以提示"正在调工具"。
+- **人工审批（human-in-the-loop）**：有副作用的工具（默认 `notify`）调用前会挂起整条流程，等人工批准才执行；
+  拒绝则不执行，并把拒绝原因回给模型让它换个做法。挂起状态落在 Redis，等几小时再批也照样接得上。
 - **全链路追踪**：每次运行的每一步自动上报 LangSmith，可按 `thread_id` / `user_id` 筛选。
 - **探活与降级可见**：`/healthz` 真实探测 Redis，连不上如实返回 `degraded`，不假装健康。
 - **接口鉴权与多租户隔离**：`Authorization: Bearer <API Key>`，身份只来自凭据；内部存储键带 `user_id` 前缀，两个用户即便使用同一个 `thread_id` 也互不可见、互不可删。
-- **零依赖测试**：29 个用例；单测不需要 Redis、网络、API Key，Redis 集成测试在无 Redis 时自动跳过。
+- **零依赖测试**：38 个用例；单测不需要 Redis、网络、API Key，Redis 集成测试在无 Redis 时自动跳过。
 
 **有意不做（留给下一步）**
 
-- 人工审批中断恢复（`interrupt`）、多 agent 协作（supervisor + worker 子图）
+- 多 agent 协作（supervisor + worker 子图）
 - 跨会话长期记忆（`AsyncRedisStore`：记住"用户是谁"，而不只是"这次聊到哪"）
 - 用户体系与限流：鉴权是静态 API Key（从 `.env` 读），没有注册登录、没有配额与速率限制
 - 评测集与回归（LangSmith dataset + evaluator）
 
-内置工具只有两个是刻意的，为了让示例保持可读。加一个工具只需三步：
+内置工具只有三个是刻意的，为了让示例保持可读。加一个工具只需三步：
 在 `src/agent_loom/tools.py` 写一个带 docstring 的 `@tool` 函数（docstring 就是模型看到的工具说明），
 加进 `TOOLS` 列表，完事——图的代码一行都不用动。
+如果这个工具有副作用，再把它加进 `APPROVAL_REQUIRED_TOOLS`，它立刻就获得了人工审批闸门：
+审批逻辑在 `review` 节点里统一实现，新工具不需要写一行审批代码。
 
 ## 架构
 
@@ -47,17 +51,18 @@
         └──────────────────┤                            │
                            │ 编译一次，进程内复用          │ 读配置
                            ▼                            ▼
-                   ┌───────────────┐            ┌───────────────┐
-                   │   LangGraph   │            │  settings.py  │◀── .env
-                   │  StateGraph   │            └───────────────┘
-                   │  agent ⇄ tools│───────────▶ LangChain：ChatOpenAI + @tool
-                   └───┬───────┬───┘
-            状态快照    │       │  每一步执行
-                       ▼       ▼
-              ┌────────────┐  ┌──────────────┐
-              │   Redis    │  │  LangSmith   │
-              │ checkpointer│ │  trace / eval│
-              └────────────┘  └──────────────┘
+                   ┌─────────────────────┐    ┌───────────────┐
+                   │      LangGraph      │    │  settings.py  │◀── .env
+                   │      StateGraph     │    └───────────────┘
+                   │                     │
+                   │ agent⇄review⇄tools  │───▶ LangChain：ChatOpenAI + @tool
+                   └───┬─────────────┬───┘
+            状态快照   │             │  每一步执行
+                       ▼             ▼
+                    ┌────────────┐  ┌──────────────┐
+                    │   Redis    │  │  LangSmith   │
+                    │ checkpointer│ │  trace / eval│
+                    └────────────┘  └──────────────┘
 ```
 
 ## 快速开始
@@ -148,13 +153,34 @@ for (;;) {
 }
 ```
 
+### 人工审批怎么试
+
+```bash
+# 有副作用的工具：请求先挂起，返回待批明细，此时工具**没有**执行
+curl -s -X POST http://127.0.0.1:8000/chat \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer local-dev-key-0001" \
+  -d '{"message":"通过 email 给运维组发一条通知：部署完成"}'
+# {"thread_id":"a1b2...","status":"pending_approval","answer":"","tool_calls":["notify"],
+#  "pending":{"type":"tool_approval","prompt":"以下工具调用有副作用，需要人工确认",
+#   "calls":[{"id":"call_00_...","name":"notify","args":{"channel":"email","message":"部署完成"}}]}}
+
+# 批准：工具真正执行；把 approved 改成 false 就不执行，comment 会作为原因回给模型
+curl -s -X POST http://127.0.0.1:8000/chat/resume \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer local-dev-key-0001" \
+  -d '{"thread_id":"a1b2...","approved":true}'
+# {"thread_id":"a1b2...","status":"completed","answer":"已通过 email 渠道发出通知，回执号 0332e838"}
+```
+
 ## 接口
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/healthz` | 探活，会真的 ping 一次 Redis，连不上返回 `degraded` |
-| `POST` | `/chat` | 一次性问答，返回最终答案与本轮调用的工具名 |
-| `POST` | `/chat/stream` | SSE 流式，事件：`start` / `token` / `node` / `done` / `error` |
+| `POST` | `/chat` | 一次性问答；命中审批则返回 `status=pending_approval` 与待批明细 |
+| `POST` | `/chat/resume` | 对挂起的调用做人工裁决（批准 / 拒绝），然后继续跑完 |
+| `POST` | `/chat/stream` | SSE 流式，事件：`start` / `token` / `node` / `interrupt` / `done` / `error` |
 | `GET` | `/threads/{thread_id}` | 读回会话的完整状态（可用来验证记忆确实落库） |
 | `DELETE` | `/threads/{thread_id}` | 删除会话，隐私合规的"用户行使删除权"落点 |
 
@@ -231,6 +257,12 @@ src/agent_loom/
   两种事件天然不同频率，需要分开处理。
 - **`CHECKPOINTER=memory` 和 `redis` 的区别**：checkpointer 是接口，两种实现可互换。
   `memory` 免 Docker、但进程一停就没了，且无法在多副本间共享，只适合本地开发。
+- **`interrupt()` 恢复时会重放节点函数**：所以 `interrupt()` 之前必须只有纯计算。
+  一旦在它前面写库、发请求，恢复时会被执行两次——human-in-the-loop 最容易踩的坑。
+- **拒绝时为什么要给每个 `tool_call` 都补 `ToolMessage`**：OpenAI 兼容协议要求二者严格一一对应，
+  少一条模型下一轮直接报协议错，所以策略是整批拒绝，让模型重新决策。
+- **为什么用 `interrupt()` 而不是 `interrupt_before=["tools"]`**：前者能在节点内按条件挂起
+  （只拦有副作用的调用）并携带业务载荷，前端据此渲染确认框；后者是静态的，无条件停在某节点前，也不带载荷。
 - **为什么请求体里没有 `user_id`**：身份只能来自凭据。客户端自报身份是最容易被写出来的鉴权漏洞。
 
 ## 常见故障排查
@@ -246,6 +278,8 @@ src/agent_loom/
 | `/chat` 返回 `401` | 没带 `Authorization` 头，或 Key 不在 `API_KEYS` 里 | 检查请求头与 `.env`；启动日志里的 `api_keys=N` 能确认配置是否生效 |
 | 启动报 `API_KEYS 里的 Key 太短` | Key 少于 16 位 | 用 `python -c "import secrets; print(secrets.token_urlsafe(32))"` 生成 |
 | 模型报 400 / model not found | `LLM_MODEL` 与 `LLM_BASE_URL` 不匹配 | 第三方端点要用它自己的模型名，如 `deepseek-chat` |
+| `/chat/resume` 返回 `409` | 该会话没有待审批的操作（已跑完，或 `thread_id` 不是挂起时返回的那个） | 用 `/chat` 返回的 `pending_approval` 里的 `thread_id`；`409` 是提醒客户端状态不同步，不是故障 |
+| SSE 里出现 `event: error` | 流式链路抛异常，`data.message` 是原始报错 | 看服务端日志的完整堆栈；同步 `/chat` 通常能复现同一个错误 |
 
 ## 测试
 
@@ -259,12 +293,13 @@ uv run ruff check .
 
 ## 下一步
 
-1. 加 `interrupt`：让高风险工具调用挂起，等人工审批后再 `Command(resume=...)` 续跑。
+1. 审批策略细化：现在按工具名整批拦（有副作用就拦）。下一步按参数拦（金额超阈值才拦）、多级审批、
+   审批超时自动拒绝、审批历史落表可审计。
 2. 把 `agent` 换成子图：一个 supervisor 节点负责分发，多个 worker 子图并行干活。
 3. 加长期记忆：用 `AsyncRedisStore` 存跨会话的用户偏好，与按会话隔离的 checkpointer 分工。
 4. 加评测：在 LangSmith 里建数据集 + evaluator，每次改提示词都跑一遍回归。
 
-详见 [docs/architecture.md](docs/architecture.md#九演进到多-agent)。
+详见 [docs/architecture.md](docs/architecture.md#十演进到多-agent)。
 
 ## License
 

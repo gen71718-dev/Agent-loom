@@ -1,8 +1,8 @@
 """HTTP 边界层。
 
 这一层刻意保持"薄"：只做鉴权、参数校验、会话 ID 编排、事件序列化。
-业务逻辑（模型怎么想、工具怎么调）全在 graph 里，这样换传输协议（gRPC、CLI、消息队列）
-都不用重写 agent。
+业务逻辑（模型怎么想、工具怎么调、什么时候该挂起等人工）全在 graph 里，
+这样换传输协议（gRPC、CLI、消息队列）都不用重写 agent。
 """
 
 from __future__ import annotations
@@ -14,10 +14,18 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.types import Command
 
 from ..observability import build_run_config
-from ..security import require_user, resolve_thread
-from .schemas import ChatRequest, ChatResponse, HealthResponse, ThreadStateResponse
+from ..security import ThreadRef, require_user, resolve_thread
+from .schemas import (
+    ChatRequest,
+    ChatResponse,
+    HealthResponse,
+    PendingApproval,
+    ResumeRequest,
+    ThreadStateResponse,
+)
 
 router = APIRouter()
 
@@ -52,6 +60,46 @@ def _sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _pending(result: dict[str, Any]) -> PendingApproval | None:
+    """从图返回里取出中断载荷。
+
+    interrupt() 挂起时，LangGraph 把载荷放在返回状态的 `__interrupt__` 键下（一个列表，
+    元素是 Interrupt 对象，真正的业务数据在 .value 里）。
+    """
+    interrupts = result.get("__interrupt__") or []
+    if not interrupts:
+        return None
+    payload = getattr(interrupts[0], "value", interrupts[0])
+    return PendingApproval.model_validate(payload)
+
+
+def _to_response(thread: ThreadRef, result: dict[str, Any]) -> ChatResponse:
+    """把图的返回状态翻译成 HTTP 响应。挂起与正常结束在这里分流。"""
+    pending = _pending(result)
+    if pending is not None:
+        return ChatResponse(
+            thread_id=thread.public,
+            status="pending_approval",
+            tool_calls=[call.name for call in pending.calls],
+            pending=pending,
+        )
+
+    messages = result["messages"]
+    answer = ""
+    for message in reversed(messages):
+        if isinstance(message, AIMessage) and _text(message.content):
+            answer = _text(message.content)
+            break
+
+    tool_calls = [
+        call["name"]
+        for message in messages
+        if isinstance(message, AIMessage)
+        for call in (message.tool_calls or [])
+    ]
+    return ChatResponse(thread_id=thread.public, answer=answer, tool_calls=tool_calls)
+
+
 @router.get("/healthz", response_model=HealthResponse)
 async def healthz(request: Request) -> HealthResponse:
     """探活接口，**故意不鉴权**：负载均衡与容器编排需要无凭据访问。
@@ -78,31 +126,44 @@ async def chat(
     request: Request,
     user: str = Depends(require_user),
 ) -> ChatResponse:
-    """一次性问答：等图跑完再返回。
+    """一次性问答。
 
-    注意 ainvoke 内部可能已经循环了多轮"模型 -> 工具 -> 模型"，
-    端到端只暴露一次请求，这对调用方是最省事的形式。
+    两种返回形态：
+    - `status=completed`：图跑完了，`answer` 里是最终回答；
+    - `status=pending_approval`：模型要调用需要审批的工具，流程已挂起，
+      客户端应把 `pending` 展示给人确认，再调 `/chat/resume`。
+    """
+    graph = request.app.state.graph
+    thread = resolve_thread(user, payload.thread_id)
+    config = build_run_config(thread.internal, user, public_thread_id=thread.public)
+    result = await graph.ainvoke({"messages": [HumanMessage(payload.message)]}, config)
+    return _to_response(thread, result)
+
+
+@router.post("/chat/resume", response_model=ChatResponse)
+async def resume_chat(
+    payload: ResumeRequest,
+    request: Request,
+    user: str = Depends(require_user),
+) -> ChatResponse:
+    """对挂起的工具调用做人工裁决：批准或拒绝，然后让图继续跑。
+
+    这就是 human-in-the-loop 的落点：`Command(resume=...)` 会把决定送回 interrupt() 的调用点，
+    图从那里接着往下走——注意是"接着走"，不是从头重放。
     """
     graph = request.app.state.graph
     thread = resolve_thread(user, payload.thread_id)
     config = build_run_config(thread.internal, user, public_thread_id=thread.public)
 
-    result = await graph.ainvoke({"messages": [HumanMessage(payload.message)]}, config)
-    messages = result["messages"]
+    snapshot = await graph.aget_state(config)
+    if not snapshot.next:
+        raise HTTPException(status_code=409, detail="该会话没有待审批的操作")
 
-    answer = ""
-    for message in reversed(messages):
-        if isinstance(message, AIMessage) and _text(message.content):
-            answer = _text(message.content)
-            break
-
-    tool_calls = [
-        call["name"]
-        for message in messages
-        if isinstance(message, AIMessage)
-        for call in (message.tool_calls or [])
-    ]
-    return ChatResponse(thread_id=thread.public, answer=answer, tool_calls=tool_calls)
+    result = await graph.ainvoke(
+        Command(resume={"approved": payload.approved, "comment": payload.comment}),
+        config,
+    )
+    return _to_response(thread, result)
 
 
 @router.post("/chat/stream")
@@ -116,6 +177,9 @@ async def chat_stream(
     stream_mode 传列表可以同时拿到多种事件：
     - "messages"：模型吐出的每一个 token（含元数据，可判断来自哪个节点）
     - "updates"：每个节点执行完的状态增量，用来告诉前端"正在调工具"
+
+    命中审批闸门时会额外发一个 `interrupt` 事件，随后 `done` 里的 `status` 会是
+    `pending_approval`，客户端据此切到 approve/reject UI。
     """
     graph = request.app.state.graph
     thread = resolve_thread(user, payload.thread_id)
@@ -123,6 +187,7 @@ async def chat_stream(
 
     async def event_stream() -> AsyncIterator[str]:
         yield _sse("start", {"thread_id": thread.public})
+        status = "completed"
         try:
             async for mode, chunk in graph.astream(
                 {"messages": [HumanMessage(payload.message)]},
@@ -138,11 +203,16 @@ async def chat_stream(
                     if text:
                         yield _sse("token", {"text": text})
                 else:
-                    for node in chunk:
+                    for node, update in chunk.items():
+                        if node == "__interrupt__":
+                            status = "pending_approval"
+                            payload_value = getattr(update[0], "value", {}) if update else {}
+                            yield _sse("interrupt", payload_value)
+                            continue
                         yield _sse("node", {"node": node})
         except Exception as exc:
             yield _sse("error", {"message": str(exc)})
-        yield _sse("done", {"thread_id": thread.public})
+        yield _sse("done", {"thread_id": thread.public, "status": status})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers=SSE_HEADERS)
 

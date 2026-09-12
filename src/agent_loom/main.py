@@ -59,7 +59,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(
         title=settings.app_name,
-        version="0.2.0",
+        version="0.3.0",
         description="LangGraph + Redis + LangSmith + FastAPI 的单智能体服务",
         lifespan=lifespan,
     )

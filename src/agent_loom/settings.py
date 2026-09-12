@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # 鉴权：格式 `key:user_id,key:user_id`。留空则拒绝所有请求（fail closed）
     api_keys: str = ""
 
+    # 需要人工审批才能执行的工具名，逗号分隔。留空表示全部自动执行
+    approval_required_tools: str = "notify"
+
     @field_validator("llm_base_url", mode="after")
     @classmethod
     def _blank_to_none(cls, value: str | None) -> str | None:
@@ -84,6 +87,11 @@ class Settings(BaseSettings):
             key, _, user_id = item.partition(":")
             result[key] = user_id
         return result
+
+    @property
+    def approval_required(self) -> set[str]:
+        """需要人工审批的工具名集合。"""
+        return {item.strip() for item in self.approval_required_tools.split(",") if item.strip()}
 
     @property
     def cors_origin_list(self) -> list[str]:

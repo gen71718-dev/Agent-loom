@@ -1,6 +1,6 @@
 [project]
 name = "agent-loom"
-version = "0.2.0"
+version = "0.3.0"
 description = "AgentLoom - a single-agent service with LangGraph orchestration, Redis memory, LangSmith tracing and a FastAPI edge."
 readme = "README.md"
 requires-python = ">=3.11"
