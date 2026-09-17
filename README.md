@@ -84,11 +84,6 @@ cp .env.example .env      # 填入 LLM_API_KEY；要开追踪再填 LANGSMITH_AP
 uv run uvicorn agent_loom.main:app --reload --port 8000
 ```
 
-看到这行日志才算真的起来了：
-
-```
-INFO:agent_loom:AgentLoom ready | model=deepseek-chat | redis=redis://localhost:6379/0 | tracing=True | api_keys=1
-```
 
 `api_keys` 是已加载的凭据数量。为 0 时所有 `/chat` 与 `/threads` 请求都会被拒绝——这是刻意的
 fail-closed，而不是默认放行。
