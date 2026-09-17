@@ -99,7 +99,7 @@ LLM_MODEL=deepseek-chat
 LLM_BASE_URL=https://api.deepseek.com/v1
 ```
 
-## 试一试
+## 实操
 
 ```bash
 # 第一轮
@@ -128,7 +128,7 @@ curl -s -H "Authorization: Bearer local-dev-key-0001" http://127.0.0.1:8000/thre
 # 重启服务，再问一次"我叫什么" —— 上下文依然在，这就是 checkpointer 的价值
 ```
 
-浏览器端消费 SSE 的样子（前端直接照抄）：
+浏览器端消费 SSE 的样子：
 
 ```javascript
 const res = await fetch("http://127.0.0.1:8000/chat/stream", {
